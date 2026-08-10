@@ -903,3 +903,54 @@ def test_infer_rel_reference_anchor_zero_is_a_distinct_anchor():
         + [stt.Type(fp32=stt.Type.FP32(nullability=stt.Type.NULLABILITY_NULLABLE))]
     )
     assert infer_plan_schema(plan).struct == expected
+
+
+def test_anchor_index_is_built_only_when_a_rel_reference_needs_it(monkeypatch):
+    # Indexing rel_anchors walks every relation *and* every expression of the plan to
+    # reach the relations embedded in subqueries, so it is whole-plan work on every
+    # call. Plans carrying an id-based OuterReference are the exception, and the
+    # builders re-infer their input's schema at every level, so the index is built on
+    # demand rather than for every inference.
+    import substrait.type_inference as type_inference
+
+    iter_plan_rels = type_inference.iter_plan_rels
+    indexed = []
+
+    def counting_iter_plan_rels(plan):
+        indexed.append(plan)
+        return iter_plan_rels(plan)
+
+    monkeypatch.setattr(type_inference, "iter_plan_rels", counting_iter_plan_rels)
+
+    plain = stp.Plan(
+        relations=[stp.PlanRel(root=stalg.RelRoot(input=read_rel, names=["a"]))]
+    )
+    assert infer_plan_schema(plain).struct == struct
+    assert indexed == []
+
+    # A rel_reference does need it, and still gets it.
+    anchored = stalg.Rel(
+        read=stalg.ReadRel(
+            base_schema=named_struct,
+            common=stalg.RelCommon(rel_anchor=7),
+            named_table=stalg.ReadRel.NamedTable(names=["shared"]),
+        )
+    )
+    correlated = stp.Plan(
+        relations=[
+            stp.PlanRel(rel=anchored),
+            stp.PlanRel(
+                root=stalg.RelRoot(
+                    input=stalg.Rel(
+                        project=stalg.ProjectRel(
+                            input=right_read_rel,
+                            expressions=[_outer_ref(2, rel_reference=7)],
+                        )
+                    ),
+                    names=["a", "b", "c"],
+                )
+            ),
+        ]
+    )
+    assert len(infer_plan_schema(correlated).struct.types) == 3
+    assert len(indexed) == 1

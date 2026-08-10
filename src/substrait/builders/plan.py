@@ -31,8 +31,10 @@ from substrait.type_inference import (
     _outer_anchor_binding,
     infer_plan_schema,
     join_output_names,
+    remember_rel_output_schema,
 )
 from substrait.utils import (
+    child_rels,
     plan_subtrees,
     rebase_reference_ordinals,
     remap_function_references,
@@ -148,6 +150,33 @@ def _merge_input_subtrees(bound_inputs):
     return subtree_planrels, rebased_root_inputs
 
 
+def _remember_input_schemas(plan: stp.Plan, bound_inputs) -> None:
+    """Record each embedded input relation's output schema for the build in progress.
+
+    Assigning an input's root ``Rel`` into the output relation copies it, so the
+    schema just inferred for that input is unreachable from the copy by identity and
+    every enclosing level would re-walk the whole subtree below it. Naming the copies
+    here is what keeps that walk from happening (see
+    ``type_inference.remember_rel_output_schema``); the schemas themselves are not
+    inferred, only pointed at, so a builder that never needs its input's schema still
+    never causes one to be inferred.
+
+    The pairing is positional: the i-th child ``Rel`` of the assembled relation, in
+    field declaration order, is the i-th bound input. Every builder here hands
+    ``make_rel``'s ``inp`` to its relation in that order (``left=inp[0],
+    right=inp[1]``, ``inputs=inp``); the count is checked below, and the order is
+    pinned by a test over every builder that embeds more than one input, since a
+    silent swap would hand a level its sides' schemas the wrong way round.
+    """
+    children = list(child_rels(plan.relations[-1].root.input))
+    assert len(children) == len(bound_inputs), (
+        f"assembled relation embeds {len(children)} input relation(s) but the builder "
+        f"bound {len(bound_inputs)}"
+    )
+    for child, bound_input in zip(children, bound_inputs):
+        remember_rel_output_schema(child, bound_input)
+
+
 def _plan_from(
     bound_inputs, make_rel, names, metadata_sources, *, include_version=True
 ):
@@ -172,7 +201,9 @@ def _plan_from(
     }
     if include_version:
         kwargs["version"] = default_version
-    return stp.Plan(**kwargs)
+    plan = stp.Plan(**kwargs)
+    _remember_input_schemas(plan, bound_inputs)
+    return plan
 
 
 def with_execution_behavior(
@@ -210,6 +241,9 @@ def with_execution_behavior(
         result.ClearField("extension_urns")
         result.ClearField("extensions")
         result.execution_behavior.variable_eval_mode = variable_eval_mode
+        # The copy carries the input's relations verbatim, so its root has the input's
+        # output schema -- recorded against the copy, which is a different object.
+        remember_rel_output_schema(result.relations[-1].root.input, bound_plan)
         return result
 
     return build_scoped(resolve)
@@ -559,7 +593,7 @@ def reference(plan: PlanOrUnbound) -> UnboundPlan:
         promoted = stp.PlanRel(rel=bound.relations[-1].root.input)
         names = list(bound.relations[-1].root.names)
         ref = stalg.Rel(reference=stalg.ReferenceRel(subtree_ordinal=ordinal))
-        return stp.Plan(
+        result = stp.Plan(
             version=default_version,
             relations=[
                 *nested,
@@ -568,6 +602,13 @@ def reference(plan: PlanOrUnbound) -> UnboundPlan:
             ],
             **_merge_plan_metadata(bound),
         )
+        # Both the ReferenceRel and the subtree it points at have the promoted plan's
+        # output schema. Recording them means resolving a reference costs a lookup
+        # rather than a walk of the shared subtree -- which every downstream verb of a
+        # cached frame would otherwise repeat.
+        for rel in (result.relations[-1].root.input, result.relations[ordinal].rel):
+            remember_rel_output_schema(rel, bound)
+        return result
 
     return build_scoped(resolve)
 
