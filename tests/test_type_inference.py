@@ -954,3 +954,53 @@ def test_anchor_index_is_built_only_when_a_rel_reference_needs_it(monkeypatch):
     )
     assert len(infer_plan_schema(correlated).struct.types) == 3
     assert len(indexed) == 1
+
+
+# The relations that emit their input's rows unchanged. Their schema is their input's,
+# so they are worth pinning together: the builders reach them only when a further verb
+# resolves the schema above one, which no test happened to do for sort.
+PASS_THROUGH_RELS = {
+    "filter": stalg.Rel(filter=stalg.FilterRel(input=read_rel)),
+    "fetch": stalg.Rel(fetch=stalg.FetchRel(input=read_rel)),
+    "sort": stalg.Rel(
+        sort=stalg.SortRel(
+            input=read_rel,
+            sorts=[
+                stalg.SortField(
+                    expr=stalg.Expression(
+                        selection=stalg.Expression.FieldReference(
+                            root_reference=stalg.Expression.FieldReference.RootReference(),
+                            direct_reference=stalg.Expression.ReferenceSegment(
+                                struct_field=stalg.Expression.ReferenceSegment.StructField(
+                                    field=0
+                                )
+                            ),
+                        )
+                    ),
+                    direction=stalg.SortField.SORT_DIRECTION_ASC_NULLS_LAST,
+                )
+            ],
+        )
+    ),
+    "exchange": stalg.Rel(exchange=stalg.ExchangeRel(input=read_rel)),
+    "top_n": stalg.Rel(top_n=stalg.TopNRel(input=read_rel)),
+}
+
+
+@pytest.mark.parametrize("rel", PASS_THROUGH_RELS.values(), ids=PASS_THROUGH_RELS)
+def test_inference_pass_through_rels_keep_the_input_schema(rel):
+    assert infer_rel_schema(rel) == struct
+
+
+@pytest.mark.parametrize("rel", PASS_THROUGH_RELS.values(), ids=PASS_THROUGH_RELS)
+def test_inference_pass_through_rels_apply_emit(rel):
+    # A pass-through relation still projects through its own emit, so the schema it
+    # reports is not unconditionally its input's.
+    emitted = stalg.Rel()
+    emitted.CopyFrom(rel)
+    node = getattr(emitted, emitted.WhichOneof("rel_type"))
+    node.common.emit.output_mapping.extend([2, 0])
+
+    assert infer_rel_schema(emitted) == stt.Type.Struct(
+        types=[struct.types[2], struct.types[0]], nullability=struct.nullability
+    )
