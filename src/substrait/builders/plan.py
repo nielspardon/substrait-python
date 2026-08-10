@@ -26,7 +26,6 @@ from substrait.extension_registry import (
     current_collector,
 )
 from substrait.type_inference import (
-    _join_output_struct,
     _join_struct_from_schemas,
     _outer_anchor_binding,
     infer_plan_schema,
@@ -165,14 +164,21 @@ def _remember_input_schemas(plan: stp.Plan, bound_inputs) -> None:
     field declaration order, is the i-th bound input. Every builder here hands
     ``make_rel``'s ``inp`` to its relation in that order (``left=inp[0],
     right=inp[1]``, ``inputs=inp``); the count is checked below, and the order is
-    pinned by a test over every builder that embeds more than one input, since a
-    silent swap would hand a level its sides' schemas the wrong way round.
+    pinned by tests over the builders that embed more than one input -- one per
+    two-field builder, plus ``set`` for the repeated-field shape -- since a silent
+    swap would hand a level its sides' schemas the wrong way round.
+
+    The count mismatch raises rather than asserting: ``assert`` is stripped under
+    ``python -O``, and with it gone ``zip`` would truncate silently, leaving a child
+    holding another input's schema -- a wrong schema in the emitted plan rather than a
+    loud failure.
     """
     children = list(child_rels(plan.relations[-1].root.input))
-    assert len(children) == len(bound_inputs), (
-        f"assembled relation embeds {len(children)} input relation(s) but the builder "
-        f"bound {len(bound_inputs)}"
-    )
+    if len(children) != len(bound_inputs):
+        raise ValueError(
+            f"assembled relation embeds {len(children)} input relation(s) but the "
+            f"builder bound {len(bound_inputs)}"
+        )
     for child, bound_input in zip(children, bound_inputs):
         remember_rel_output_schema(child, bound_input)
 
@@ -243,7 +249,12 @@ def with_execution_behavior(
         result.execution_behavior.variable_eval_mode = variable_eval_mode
         # The copy carries the input's relations verbatim, so its root has the input's
         # output schema -- recorded against the copy, which is a different object.
-        remember_rel_output_schema(result.relations[-1].root.input, bound_plan)
+        # Guarded on there being a query root to record: this builder takes a raw
+        # caller-supplied Plan and, unlike every other one here, does not assemble the
+        # relations itself, so it must stay total over the Plans it accepted before --
+        # including one carrying no relations at all, or none that is a root.
+        if result.relations and result.relations[-1].WhichOneof("rel_type") == "root":
+            remember_rel_output_schema(result.relations[-1].root.input, bound_plan)
         return result
 
     return build_scoped(resolve)
@@ -685,16 +696,17 @@ def join(
         # post_join_filter is applied to each output record after
         # join-type-specific output formation (semantically a FilterRel above the
         # join), so it resolves against the output schema -- which for semi/anti
-        # joins is a single side, not the combined schema.
+        # joins is a single side, not the combined schema. Combined from the schemas
+        # already inferred above rather than re-inferred from the input relations:
+        # re-inference would walk both subtrees again, and it would do so without the
+        # inputs' shared-subtree lists in scope, so a `reference()`-promoted input
+        # (whose root is a plan-global ReferenceRel) could not resolve at all.
         bound_post = None
         if post_join_filter is not None:
             output_ns = stt.NamedStruct(
                 names=out_names,
-                struct=_join_output_struct(
-                    type_name,
-                    bound_left.relations[-1].root.input,
-                    bound_right.relations[-1].root.input,
-                    registry=registry,
+                struct=_join_struct_from_schemas(
+                    type_name, left_ns.struct, right_ns.struct
                 ),
             )
             bound_post = resolve_expression(post_join_filter, output_ns, registry)
@@ -1340,16 +1352,16 @@ def _physical_equi_join(rel_name, rel_cls):
             # semi/anti joins is a single side. residual_expression is evaluated
             # on each candidate key-match (both rows present), so it resolves
             # against the combined left+right schema. Each is built only when the
-            # corresponding predicate is supplied.
+            # corresponding predicate is supplied. The output schema is combined from
+            # the schemas already inferred above rather than re-inferred from the
+            # input relations -- see `join` for why re-inference cannot resolve a
+            # `reference()`-promoted input.
             bound_post = None
             if post_join_filter is not None:
                 output_ns = stt.NamedStruct(
                     names=names,
-                    struct=_join_output_struct(
-                        type_name,
-                        bound_left.relations[-1].root.input,
-                        bound_right.relations[-1].root.input,
-                        registry=registry,
+                    struct=_join_struct_from_schemas(
+                        type_name, left_ns.struct, right_ns.struct
                     ),
                 )
                 bound_post = resolve_expression(post_join_filter, output_ns, registry)

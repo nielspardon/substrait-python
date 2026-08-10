@@ -7,7 +7,7 @@ import substrait.extended_expression_pb2 as stee
 import substrait.plan_pb2 as stp
 import substrait.type_pb2 as stt
 
-from substrait.utils import iter_plan_rels, plan_subtrees, rel_anchor_of
+from substrait.utils import child_rels, iter_plan_rels, plan_subtrees, rel_anchor_of
 
 
 class _SubtreeScope:
@@ -73,22 +73,24 @@ class _AnchorScope:
     input, at build or inference time). ``parent`` chains to an enclosing scope so
     nested correlations still resolve outer anchors.
 
-    The index itself may be supplied as a zero-argument factory instead of a dict,
-    and is then built only if an id-based reference actually asks for an anchor.
-    Indexing a plan means walking every relation *and* every expression in it to
-    find the relations embedded in subqueries, which is whole-plan work; plans
-    carrying an id-based ``OuterReference`` at all are the exception, and a builder
-    re-infers its input's schema at every level (see :class:`_SchemaMemo`), so
-    building the index eagerly made that walk the single largest cost of assembling
-    a long pipeline.
+    The index arrives as a zero-argument factory and is built only if an id-based
+    reference actually asks for an anchor. Indexing a plan means walking every relation
+    *and* every expression in it to find the relations embedded in subqueries, which is
+    whole-plan work; plans carrying an id-based ``OuterReference`` at all are the
+    exception, and a builder re-infers its input's schema at every level (see
+    :class:`_SchemaMemo`), so building the index eagerly made that walk the single
+    largest cost of assembling a long pipeline.
     """
 
     __slots__ = ("_rels", "_index", "_subtrees", "_schemas", "_resolving", "_parent")
 
-    def __init__(self, rels, subtrees, *, parent=None):
-        # Either the index or a factory for it; whichever it is not stays None.
-        self._rels: Optional[dict] = rels if isinstance(rels, dict) else None
-        self._index = None if isinstance(rels, dict) else rels
+    def __init__(self, index, subtrees, *, parent=None):
+        # ``index`` is always a factory, never the index itself: a caller with an
+        # already-built dict passes ``dict`` or a lambda, which keeps this from having
+        # to tell the two apart -- a test that got it wrong would report the mistake as
+        # an uncallable-object TypeError from deep inside a later lookup.
+        self._rels: Optional[dict] = None
+        self._index = index
         self._subtrees = subtrees
         self._schemas: dict = {}
         self._resolving: set = set()
@@ -99,7 +101,7 @@ class _AnchorScope:
         self._schemas[anchor] = struct
 
     def _anchors(self) -> dict:
-        """The anchor index, built on first use if it was supplied as a factory."""
+        """The anchor index, built on first use and kept."""
         if self._rels is None:
             self._rels = self._index()
             self._index = None
@@ -118,7 +120,7 @@ class _AnchorScope:
             )
         self._resolving.add(anchor)
         try:
-            rel = self._rels[anchor]
+            rel = self._anchors()[anchor]
             # A lateral-join anchor denotes the current left row, not the join's
             # own output; every other anchor resolves against its output schema.
             target = (
@@ -163,19 +165,32 @@ class _SchemaMemo:
     input one level down is therefore unreachable by object identity from the copy,
     so every level re-walks the whole subtree beneath it and an N-verb chain does
     O(N^2) inference (#207). The copy *is* reachable at the moment it is made,
-    though, and protobuf message wrappers are identity-stable, so the builder
-    records "this relation's output schema is that plan's output schema" and
-    :func:`infer_rel_schema` stops at the boundary instead of recursing through it.
+    though, so the builder records "this relation's output schema is that plan's
+    output schema" and :func:`infer_rel_schema` stops at the boundary instead of
+    recursing through it.
+
+    Keying that on ``id(rel)`` only works because the entry holds the ``Rel`` itself:
+    a protobuf message wrapper is *not* permanently cached, so under the upb
+    implementation a submessage whose last Python reference is dropped is re-wrapped
+    at a fresh -- possibly recycled -- address on the next access. Holding it pins
+    both the object and its id for the memo's lifetime, which is what makes a hit
+    provably the relation that was recorded rather than a later tenant of its id.
 
     What is recorded is the ``Plan`` the schema comes from, not the schema, resolved
     on first lookup and then kept. Recording it eagerly would mean inferring schemas
     no one asked for, and inference can legitimately fail where building does not --
-    ``set``, ``reference`` and ``exchange`` never look at their input's schema today,
-    so a plan they accept (an extension relation with no registered deriver, say)
-    has to keep building. The cost of deferring is that an unresolved entry keeps its
-    input plan alive until the build finishes rather than until the level above it
-    returns; the entries a chain of verbs produces are consumed one level up, and the
-    rest is bounded by the plan under construction.
+    ``set``, ``reference`` and ``exchange`` (and, among the builders that copy rather
+    than assemble, ``with_execution_behavior``) never look at their input's schema
+    today, so a plan they accept (an extension relation with no registered deriver,
+    say) has to keep building.
+
+    An entry costs more memory than a schema: keying on identity means holding a live
+    submessage, and a submessage keeps its whole plan's arena allocated, so each entry
+    holds an entire intermediate plan. Left to accumulate, that makes peak memory over
+    an N-verb build the sum of the intermediates rather than the couple of levels in
+    flight (measured at 10 MB flat versus 26 MB at 32 verbs over a 2000-column table).
+    :meth:`_release_inputs_of` is what keeps it flat, and where it can drop an entry
+    safely is the whole of the reasoning -- see there.
 
     Only builders write here; inference never memoizes on its own. A relation's
     output struct can depend on ambient correlation context (``outer_schemas``,
@@ -199,6 +214,24 @@ class _SchemaMemo:
         """Record that ``rel``'s output schema is the output schema of ``plan``."""
         self._pending[id(rel)] = (rel, plan)
 
+    def _release_inputs_of(self, plan: stp.Plan) -> None:
+        """Drop the entries recorded for ``plan``'s own input relations.
+
+        Called once a lookup has resolved through ``plan``: those entries existed to
+        answer that resolution, and nothing above can reach the relations they key on
+        again, because each enclosing level embedded a *copy*. Dropping them is what
+        keeps retention flat -- the key of a resolved entry is a live submessage, and
+        a submessage keeps its whole plan's arena allocated, so holding one holds an
+        entire intermediate plan. Kept, they would make peak memory over an N-verb
+        build the sum of the intermediates instead of the two levels in flight.
+        """
+        relations = plan.relations
+        if not relations or relations[-1].WhichOneof("rel_type") != "root":
+            return
+        for child in child_rels(relations[-1].root.input):
+            self._structs.pop(id(child), None)
+            self._pending.pop(id(child), None)
+
     def struct_of(self, rel: stalg.Rel, registry) -> Optional[stt.Type.Struct]:
         """``rel``'s remembered output struct, or None if nothing was recorded."""
         key = id(rel)
@@ -218,6 +251,7 @@ class _SchemaMemo:
             struct = infer_plan_schema(pending[1], registry=registry).struct
         finally:
             self._resolving.discard(key)
+        self._release_inputs_of(pending[1])
         self._structs[key] = (rel, struct)
         # The plan was held only to answer this; the struct replaces it.
         del self._pending[key]
@@ -266,7 +300,7 @@ def _outer_anchor_binding(anchor, struct):
     though the join relation is not yet in an anchor index. Nested lateral joins
     compose via the parent chain.
     """
-    scope = _AnchorScope({}, (), parent=anchor_scope.get())
+    scope = _AnchorScope(dict, (), parent=anchor_scope.get())
     scope.register(anchor, struct)
     token = anchor_scope.set(scope)
     try:

@@ -962,26 +962,10 @@ def test_anchor_index_is_built_only_when_a_rel_reference_needs_it(monkeypatch):
 PASS_THROUGH_RELS = {
     "filter": stalg.Rel(filter=stalg.FilterRel(input=read_rel)),
     "fetch": stalg.Rel(fetch=stalg.FetchRel(input=read_rel)),
-    "sort": stalg.Rel(
-        sort=stalg.SortRel(
-            input=read_rel,
-            sorts=[
-                stalg.SortField(
-                    expr=stalg.Expression(
-                        selection=stalg.Expression.FieldReference(
-                            root_reference=stalg.Expression.FieldReference.RootReference(),
-                            direct_reference=stalg.Expression.ReferenceSegment(
-                                struct_field=stalg.Expression.ReferenceSegment.StructField(
-                                    field=0
-                                )
-                            ),
-                        )
-                    ),
-                    direction=stalg.SortField.SORT_DIRECTION_ASC_NULLS_LAST,
-                )
-            ],
-        )
-    ),
+    # Bare of sort fields, like the fetch/top_n entries are of counts: a pass-through
+    # relation's schema comes from its input and its own emit, and inference reads
+    # neither the sorts nor the counts.
+    "sort": stalg.Rel(sort=stalg.SortRel(input=read_rel)),
     "exchange": stalg.Rel(exchange=stalg.ExchangeRel(input=read_rel)),
     "top_n": stalg.Rel(top_n=stalg.TopNRel(input=read_rel)),
 }

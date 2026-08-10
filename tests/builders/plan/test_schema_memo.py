@@ -29,6 +29,7 @@ from substrait.builders.plan import (
     project,
     read_named_table,
     reference,
+    set,
     with_execution_behavior,
     write_named_table,
 )
@@ -90,7 +91,10 @@ def _project_chain(length: int):
 
 
 # Deliberately well above the 4N-4 this currently does and well below the ~N^2/2 it
-# did before, so the test tracks the complexity class rather than the exact count.
+# did before, so the test tracks the complexity class rather than the exact count. Only
+# the longer chains can discriminate: unmemoized costs 10/36/136/528 for the four
+# lengths, so 4 and 8 come in under any bound that 16 and 32 fail, and are here to
+# exercise short chains rather than to catch the regression.
 _CALLS_PER_VERB = 6
 
 
@@ -102,24 +106,41 @@ def test_building_a_chain_infers_each_level_a_bounded_number_of_times(counts, le
     assert counts["infer_rel_schema"] <= _CALLS_PER_VERB * length
 
 
-def test_chain_inference_grows_linearly_not_quadratically(counts):
-    _project_chain(8)(registry)
-    short = counts["infer_rel_schema"]
-    counts.clear()
-    _project_chain(32)(registry)
-    long = counts["infer_rel_schema"]
-
-    # Four times the verbs, so linear allows roughly four times the inferences (with
-    # headroom); quadratic would be sixteen.
-    assert long <= 6 * short
-
-
 def test_building_a_chain_never_indexes_rel_anchors(counts):
     # Indexing walks every relation and expression in the plan. Nothing here carries
-    # an id-based OuterReference, so nothing should ask for the index.
+    # an id-based OuterReference, so nothing should ask for the index. Asserted against
+    # a positive control, because a Counter reads 0 for a key nothing ever wrote: were
+    # the patch to stop intercepting, a bare `== 0` would keep passing.
     _project_chain(8)(registry)
-
+    assert counts["infer_rel_schema"] > 0
     assert counts["iter_plan_rels"] == 0
+
+
+def test_memo_retention_does_not_grow_with_chain_length():
+    # An entry keys on a live submessage, which keeps its whole plan's arena alive, so
+    # entries that accumulate hold every intermediate plan of the build rather than the
+    # levels in flight. `_release_inputs_of` drops each entry once it has been resolved
+    # through; this pins that, by watching how many are ever live at once.
+    peaks = {}
+    for length in (4, 8, 16, 32):
+        peak = 0
+        original = type_inference._SchemaMemo.remember_plan_output
+
+        def counting_remember(self, rel, plan):
+            nonlocal peak
+            original(self, rel, plan)
+            peak = max(peak, len(self._structs) + len(self._pending))
+
+        type_inference._SchemaMemo.remember_plan_output = counting_remember
+        try:
+            _project_chain(length)(registry)
+        finally:
+            type_inference._SchemaMemo.remember_plan_output = original
+        peaks[length] = peak
+
+    # Bounded by the levels in flight, not by the chain: 8x the verbs must not mean
+    # meaningfully more live entries.
+    assert peaks[32] <= peaks[4] + 2, peaks
 
 
 def test_memo_does_not_outlive_the_build():
@@ -150,8 +171,10 @@ def _true():
     return literal(True, boolean())
 
 
-# Every builder that embeds more than one input relation, since those are the ones
-# whose recorded schemas could be paired with the wrong side.
+# The builders that embed more than one input relation into a *pair* of fields, since
+# those are the ones whose recorded schemas could be paired with the wrong side. The
+# repeated-field ones (`set`, `extension_multi`) take their inputs in one list and are
+# covered separately below, where order shows up in the output rather than in the types.
 TWO_INPUT_BUILDERS = {
     "join": lambda: join(_left(), _right(), _true(), stalg.JoinRel.JOIN_TYPE_INNER),
     "cross": lambda: cross(_left(), _right()),
@@ -185,6 +208,61 @@ def test_two_input_builders_record_each_side_against_its_own_relation(builder):
         i64(nullable=False),
         string(),
     ]
+
+
+def test_lateral_join_records_a_correlated_right_input_against_its_own_relation():
+    # `lateral_join` assembles its relation *outside* the anchor binding its right input
+    # was built under, so the recorded schema is resolved later, with the binding
+    # re-established by inference rather than by the builder. A right input that
+    # actually correlates is what exercises that: it can only be inferred while the
+    # left row is bound to the join's rel_anchor.
+    lateral = lateral_join(
+        _left(),
+        lambda handle: project(_right(), expressions=[handle.column("k")]),
+        stalg.JoinRel.JOIN_TYPE_INNER,
+    )
+    written = write_named_table("out", lateral)(registry)
+
+    table_schema = written.relations[-1].root.input.write.table_schema
+    assert list(table_schema.names) == ["k", "v", "rk", "rv", "k"]
+    assert list(table_schema.struct.types) == [
+        i64(nullable=False),
+        i64(nullable=False),
+        i64(nullable=False),
+        string(),
+        i64(nullable=False),
+    ]
+
+
+def test_set_records_each_input_against_its_own_relation():
+    # SetRel takes its inputs as one repeated field, so a mispairing shows up in the
+    # ops whose output is not symmetric in the inputs: MINUS takes each field's
+    # nullability from the *primary* (first) input alone, so pairing the recorded
+    # schemas the wrong way round reports the secondary's nullability instead.
+    primary = read_named_table(
+        "primary",
+        stt.NamedStruct(
+            names=["k"],
+            struct=stt.Type.Struct(
+                types=[i64(nullable=False)], nullability=stt.Type.NULLABILITY_REQUIRED
+            ),
+        ),
+    )
+    secondary = read_named_table(
+        "secondary",
+        stt.NamedStruct(
+            names=["k"],
+            struct=stt.Type.Struct(
+                types=[i64(nullable=True)], nullability=stt.Type.NULLABILITY_REQUIRED
+            ),
+        ),
+    )
+    written = write_named_table(
+        "out", set([primary, secondary], stalg.SetRel.SET_OP_MINUS_PRIMARY)
+    )(registry)
+
+    table_schema = written.relations[-1].root.input.write.table_schema
+    assert list(table_schema.struct.types) == [i64(nullable=False)]
 
 
 def test_reference_records_the_promoted_subtree_and_the_reference():
