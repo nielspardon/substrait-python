@@ -189,8 +189,13 @@ class _SchemaMemo:
     holds an entire intermediate plan. Left to accumulate, that makes peak memory over
     an N-verb build the sum of the intermediates rather than the couple of levels in
     flight (measured at 10 MB flat versus 26 MB at 32 verbs over a 2000-column table).
-    :meth:`_release_inputs_of` is what keeps it flat, and where it can drop an entry
-    safely is the whole of the reasoning -- see there.
+    Entries are therefore dropped as soon as they are unreachable, which happens at two
+    points: once a lookup has resolved through a plan (:meth:`_release_boundaries_of`),
+    and
+    once a new entry is recorded over an unresolved one
+    (:meth:`remember_plan_output`) -- the second being what bounds a chain of builders
+    that resolve nothing at all. Which entries each can drop safely is the whole of the
+    reasoning; see both.
 
     Only builders write here; inference never memoizes on its own. A relation's
     output struct can depend on ambient correlation context (``outer_schemas``,
@@ -211,11 +216,49 @@ class _SchemaMemo:
         self._resolving: set = set()
 
     def remember_plan_output(self, rel: stalg.Rel, plan: stp.Plan) -> None:
-        """Record that ``rel``'s output schema is the output schema of ``plan``."""
+        """Record that ``rel``'s output schema is the output schema of ``plan``.
+
+        Recording drops the *unresolved* entries inside ``plan``, which is what bounds
+        retention for the builders that never ask their input for a schema. Those
+        builders (``set``, ``exchange``, ``reference``, ``with_execution_behavior``)
+        resolve nothing, so nothing prompts a release, and a chain of them would
+        otherwise hold one live intermediate plan per level. An entry dropped here would
+        only ever have been reached by walking into ``plan``, which is what resolving
+        ``rel`` does, so dropping it costs one deeper walk of that subtree at the first
+        inference above the chain -- paid once, since that inference resolves ``rel``
+        itself -- and buys a bound on how many intermediate plans a build holds at once.
+
+        Resolved entries stay, because they are what makes that walk unnecessary
+        everywhere else, and they cost nothing to keep: they key on submessages of
+        ``plan``, which the new entry pins anyway. A builder that *does* infer its input
+        has already resolved the boundary below by the time it assembles anything, so
+        this drops nothing on the pipelines the memo exists for.
+        """
+        self._release_boundaries_of(plan, keep_resolved=True)
         self._pending[id(rel)] = (rel, plan)
 
-    def _release_inputs_of(self, plan: stp.Plan) -> None:
-        """Drop the entries recorded for ``plan``'s own input relations.
+    @staticmethod
+    def _boundary_rels(plan: stp.Plan):
+        """The relations of ``plan`` a builder can have recorded an entry for.
+
+        A builder records either the root input of the plan it assembled (the ones that
+        copy a plan rather than wrap its root: ``with_execution_behavior``,
+        ``reference``) or that relation's own inputs (everything assembled through
+        ``_plan_from``), so those two levels are where every entry keyed inside a plan
+        sits. Walking deeper would find only relations no builder ever named, because
+        each level embeds a copy of what is beneath it.
+        """
+        relations = plan.relations
+        if not relations or relations[-1].WhichOneof("rel_type") != "root":
+            return
+        root_input = relations[-1].root.input
+        yield root_input
+        yield from child_rels(root_input)
+
+    def _release_boundaries_of(
+        self, plan: stp.Plan, *, keep_resolved: bool = False
+    ) -> None:
+        """Drop the entries recorded inside ``plan`` (see :meth:`_boundary_rels`).
 
         Called once a lookup has resolved through ``plan``: those entries existed to
         answer that resolution, and nothing above can reach the relations they key on
@@ -224,13 +267,22 @@ class _SchemaMemo:
         a submessage keeps its whole plan's arena allocated, so holding one holds an
         entire intermediate plan. Kept, they would make peak memory over an N-verb
         build the sum of the intermediates instead of the two levels in flight.
+
+        ``keep_resolved`` spares the resolved entries, for the caller that is recording
+        rather than resolving (see :meth:`remember_plan_output`). Dropping an unresolved
+        entry cascades either way: the plan it held will never be walked now, so
+        whatever was recorded inside *that* plan is unreachable too, resolved entries
+        included.
         """
-        relations = plan.relations
-        if not relations or relations[-1].WhichOneof("rel_type") != "root":
-            return
-        for child in child_rels(relations[-1].root.input):
-            self._structs.pop(id(child), None)
-            self._pending.pop(id(child), None)
+        unswept = [(plan, keep_resolved)]
+        while unswept:
+            owner, keep = unswept.pop()
+            for boundary in self._boundary_rels(owner):
+                if not keep:
+                    self._structs.pop(id(boundary), None)
+                unresolved = self._pending.pop(id(boundary), None)
+                if unresolved is not None:
+                    unswept.append((unresolved[1], False))
 
     def struct_of(self, rel: stalg.Rel, registry) -> Optional[stt.Type.Struct]:
         """``rel``'s remembered output struct, or None if nothing was recorded."""
@@ -251,7 +303,7 @@ class _SchemaMemo:
             struct = infer_plan_schema(pending[1], registry=registry).struct
         finally:
             self._resolving.discard(key)
-        self._release_inputs_of(pending[1])
+        self._release_boundaries_of(pending[1])
         self._structs[key] = (rel, struct)
         # The plan was held only to answer this; the struct replaces it.
         del self._pending[key]

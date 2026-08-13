@@ -21,6 +21,7 @@ import substrait.type_inference as type_inference
 from substrait.builders.extended_expression import column, literal
 from substrait.builders.plan import (
     cross,
+    exchange,
     hash_join,
     join,
     lateral_join,
@@ -90,6 +91,32 @@ def _project_chain(length: int):
     return plan
 
 
+def _exchange_chain(length: int):
+    plan = read_named_table("t", named_struct)
+    for _ in range(length):
+        plan = exchange(plan, partition_count=2)
+    return plan
+
+
+def _behavior_chain(length: int):
+    plan = read_named_table("t", named_struct)
+    for _ in range(length):
+        plan = with_execution_behavior(
+            plan, stp.ExecutionBehavior.VARIABLE_EVALUATION_MODE_PER_PLAN
+        )
+    return plan
+
+
+# Chains of verbs that never ask their input for a schema, so no lookup ever resolves
+# and nothing is released by one -- the case that makes recording, not resolving, the
+# point at which unreachable entries have to be dropped. Both shapes are here because
+# they record at different depths: `exchange` names the input relation embedded in the
+# relation it assembled, `with_execution_behavior` the root input of the plan it copied,
+# one level shallower.
+NON_INFERRING_CHAINS = [_exchange_chain, _behavior_chain]
+NON_INFERRING_IDS = ["exchange", "with_execution_behavior"]
+
+
 # Deliberately well above the 4N-4 this currently does and well below the ~N^2/2 it
 # did before, so the test tracks the complexity class rather than the exact count. Only
 # the longer chains can discriminate: unmemoized costs 10/36/136/528 for the four
@@ -116,31 +143,63 @@ def test_building_a_chain_never_indexes_rel_anchors(counts):
     assert counts["iter_plan_rels"] == 0
 
 
-def test_memo_retention_does_not_grow_with_chain_length():
+@pytest.mark.parametrize(
+    "chain",
+    [_project_chain, *NON_INFERRING_CHAINS],
+    ids=["project", *NON_INFERRING_IDS],
+)
+def test_memo_retention_does_not_grow_with_chain_length(monkeypatch, chain):
     # An entry keys on a live submessage, which keeps its whole plan's arena alive, so
     # entries that accumulate hold every intermediate plan of the build rather than the
-    # levels in flight. `_release_inputs_of` drops each entry once it has been resolved
-    # through; this pins that, by watching how many are ever live at once.
+    # levels in flight. `_release_boundaries_of` drops each entry once it is unreachable
+    # -- when a lookup has resolved through it, and when a new entry is recorded over an
+    # unresolved one, which is the only release a chain that resolves nothing ever gets.
+    # This pins both, by watching how many entries are ever live at once.
     peaks = {}
+    original = type_inference._SchemaMemo.remember_plan_output
+
     for length in (4, 8, 16, 32):
         peak = 0
-        original = type_inference._SchemaMemo.remember_plan_output
 
         def counting_remember(self, rel, plan):
             nonlocal peak
             original(self, rel, plan)
             peak = max(peak, len(self._structs) + len(self._pending))
 
-        type_inference._SchemaMemo.remember_plan_output = counting_remember
-        try:
-            _project_chain(length)(registry)
-        finally:
-            type_inference._SchemaMemo.remember_plan_output = original
+        monkeypatch.setattr(
+            type_inference._SchemaMemo, "remember_plan_output", counting_remember
+        )
+        chain(length)(registry)
         peaks[length] = peak
 
     # Bounded by the levels in flight, not by the chain: 8x the verbs must not mean
     # meaningfully more live entries.
     assert peaks[32] <= peaks[4] + 2, peaks
+
+
+@pytest.mark.parametrize("chain", NON_INFERRING_CHAINS, ids=NON_INFERRING_IDS)
+def test_inference_above_a_chain_that_resolved_nothing_still_gets_its_schema(chain):
+    # Recording releases the unresolved entries it supersedes, so the first inference
+    # above such a chain walks it a level at a time instead of hopping the boundaries
+    # that were recorded through it. It has to arrive at the same schema either way.
+    built = project(chain(4), expressions=[column("v")])(registry)
+
+    schema = infer_plan_schema(built, registry=registry)
+    assert list(schema.names) == ["k", "v", "v"]
+    assert list(schema.struct.types) == [i64(nullable=False)] * 3
+
+
+@pytest.mark.parametrize("length", [4, 8, 16])
+def test_a_chain_that_resolves_nothing_costs_no_walk_per_level_above_it(counts, length):
+    # The verbs below resolve nothing, so the projections above them are what force the
+    # boundaries -- and must not each re-walk the whole run to do it.
+    project_chain = _exchange_chain(length)
+    for _ in range(length):
+        project_chain = project(project_chain, expressions=[column("v")])
+
+    project_chain(registry)
+
+    assert counts["infer_rel_schema"] <= _CALLS_PER_VERB * 2 * length
 
 
 def test_memo_does_not_outlive_the_build():
